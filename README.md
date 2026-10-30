@@ -1,7 +1,7 @@
 
 # 🌸 PinkPad
 
-> Turn your **8BitDo Ultimate C** controller into a remote mouse and media companion for macOS.
+> Turn your **8BitDo Ultimate 2C** controller into a remote mouse and media companion for macOS.
 
 **PinkPad** is a lightweight Python script that lets you control your Mac right from your couch or bed using your 8BitDo controller. Built with Python, Pygame, and PyObjC.
 
@@ -43,7 +43,6 @@ source pinkpad-env/bin/activate
 
 
 3. **Create the `requirements.txt` file:**
-Создай файл `requirements.txt` в корне проекта и добавь туда следующие зависимости:
 ```text
 pygame==2.6.1
 pyobjc-core==11.1
@@ -95,10 +94,4 @@ python3 pinkpad.py
 
 ---
 
-## 📝 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
-
-```
-
-```
