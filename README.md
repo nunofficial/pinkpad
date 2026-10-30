@@ -1,5 +1,4 @@
 
-```markdown
 # 🌸 PinkPad
 
 > Turn your **8BitDo Ultimate C** controller into a remote mouse and media companion for macOS.
