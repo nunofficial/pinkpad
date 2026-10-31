@@ -13,7 +13,7 @@
 
 <div align="center">
 
-<img src="assets/logo.png" alt="PinkPad logo" width="160">
+<img src="Pinkpad Retro Gaming Logo.png" alt="PinkPad logo" width="160">
 
 # 🎀 PinkPad
 
