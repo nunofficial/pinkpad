@@ -8,19 +8,23 @@
   X or Right Trigger  right click
   L1 / LB ........... previous Desktop (Ctrl + Left Arrow)
   R1 / RB ........... next Desktop     (Ctrl + Right Arrow)
-  Left Trigger ...... precision (slow) mode while held
-  Start ............. pause / resume the script
+  D-pad ............. scroll (up/down/left/right, hold = faster)
+  Left Trigger ...... precision (slow) mode while held (cursor + scroll)
+  − / + (Select/Start) volume down / up  (tap = 1 step, hold = keeps going)
+  − and + together .. pause / resume the script (Home button works too)
+  Y (or L3+R3) ...... show / hide the on-screen keyboard (button can be changed with --learn)
   Ctrl+C in Terminal  quit
 
 Run:        python3 pinkpad.py
 Debug map:  python3 pinkpad.py --debug     (prints raw buttons/axes)
-Learn map:  python3 pinkpad.py --learn     (wizard: teaches the script YOUR buttons)
+Learn map:  python3 pinkpad.py --learn     (teaches the −, +, Home and keyboard buttons; full wizard only if the pad isn't recognised)
 """
 
 import os
 import sys
 import json
 import math
+import subprocess
 import time
 import signal
 
@@ -35,6 +39,8 @@ import Quartz
 
 # =============================== SETTINGS ====================================
 DEADZONE = 0.14          # ignore tiny stick drift (0.0 - 1.0)
+INVERT_X = True   # True = flip left/right of the cursor stick
+INVERT_Y = True        # True = flip up/down of the cursor stick
 CURVE = 2.0              # >1 = finer control near the center of the stick
 MAX_SPEED = 1500.0       # cursor speed in pixels/second at full deflection
 PRECISION_FACTOR = 0.30  # speed multiplier while Left Trigger is held
@@ -42,24 +48,34 @@ TRIGGER_THRESHOLD = 0.5  # how far a trigger must be pulled to count as a press
 LOOP_HZ = 144            # polling rate
 DOUBLE_CLICK_TIME = 0.40 # seconds
 SPACE_COOLDOWN = 0.12    # seconds between desktop switches
+SCROLL_SPEED = 700.0     # scroll speed (pixels/second) when you start holding the D-pad
+SCROLL_MAX = 2600.0      # top scroll speed after holding for SCROLL_RAMP seconds
+SCROLL_RAMP = 1.0        # seconds of holding to reach top speed
+SCROLL_INVERT = False    # set True if the scroll direction feels backwards
+VOLUME_HOLD_DELAY = 0.35 # hold − or + this long (seconds) and the volume starts repeating
+VOLUME_REPEAT = 0.09     # seconds between volume steps while holding
+OSK_BUTTON = "y"          # extra single button for the on-screen keyboard ("y", "b" or None). L3+R3 always works too
+VOLUME_METHOD = "keys"   # "keys" = real macOS volume keys (with on-screen HUD); "osascript" = alternative if keys do nothing
+VOLUME_STEP = 6          # percent per step (only for VOLUME_METHOD = "osascript")
 
 # Raw joystick fallback (used if SDL doesn't recognise the pad as a standard
 # game controller). Run `python3 pinkpad.py --learn` once: it saves your real
 # mapping to ~/.pinkpad_map.json and these defaults get overridden automatically.
 RAW_AXES = {"lx": 0, "ly": 1}
-RAW_BUTTONS = {"a": 0, "x": 2, "lb": 9, "rb": 10, "start": 6}
+RAW_BUTTONS = {"a": 0, "x": 2, "lb": 9, "rb": 10, "start": 6, "back": 4, "guide": 5, "star": 99, "l3": 99, "r3": 99, "y": 3, "b": 1}
 RAW_SIGN = {"lx": 1, "ly": 1}
 RAW_TRIGGERS = {
     "lt": {"type": "axis", "index": 4, "rest": -1.0, "full": 1.0},
     "rt": {"type": "axis", "index": 5, "rest": -1.0, "full": 1.0},
 }
 MAP_FILE = os.path.expanduser("~/.pinkpad_map.json")
-FORCE_RAW = False
+# Buttons taught by --learn (raw joystick button numbers). They override the standard mapping:
+# "back" = −/Select, "start" = +/Start, "guide" = Home.
+EXTRA_BUTTONS = {}
 
 
 def load_map():
-    """Load the mapping saved by --learn (if any)."""
-    global FORCE_RAW
+    """Load the mapping saved by --learn (used ONLY if SDL doesn't recognise the pad)."""
     try:
         with open(MAP_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -67,7 +83,7 @@ def load_map():
         RAW_BUTTONS.update(data.get("buttons", {}))
         RAW_SIGN.update(data.get("sign", {}))
         RAW_TRIGGERS.update(data.get("triggers", {}))
-        FORCE_RAW = bool(data.get("force_raw", False))
+        EXTRA_BUTTONS.update({k: v for k, v in data.get("extra_buttons", {}).items() if isinstance(v, int)})
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -80,6 +96,9 @@ load_map()
 KEY_LEFT_ARROW = 123
 KEY_RIGHT_ARROW = 124
 KEY_CONTROL = 59
+KEY_COMMAND = 55
+KEY_OPTION = 58
+KEY_F5 = 96
 
 # ================================ PINK UI ====================================
 PINK = "\033[38;2;255;105;180m"
@@ -102,7 +121,10 @@ def banner():
    ╚═══════════════════════════════════════════╝{RESET}
 {PINK}   Left stick  {SOFT}→ mouse            {PINK}A        {SOFT}→ left click
 {PINK}   X / RT      {SOFT}→ right click      {PINK}LT (hold){SOFT}→ precision mode
-{PINK}   L1 / R1     {SOFT}→ switch desktops  {PINK}Start    {SOFT}→ pause / resume
+{PINK}   L1 / R1     {SOFT}→ switch desktops  {PINK}− / +     {SOFT}→ volume down / up
+{PINK}   − and + together {SOFT}→ pause / resume
+{PINK}   D-pad       {SOFT}→ scroll (hold = faster)
+{PINK}   Y (or L3+R3) {SOFT}→ show / hide on-screen keyboard
 {PINK}   Ctrl+C      {SOFT}→ quit{RESET}
 """)
 
@@ -203,6 +225,18 @@ class MacMouse:
         self.right_down = down
         self._button(True, down)
 
+    def scroll(self, dx, dy):
+        """Smooth pixel scrolling. dy > 0 scrolls up, dx > 0 scrolls left."""
+        self._sx = getattr(self, "_sx", 0.0) + dx
+        self._sy = getattr(self, "_sy", 0.0) + dy
+        ix, iy = int(self._sx), int(self._sy)
+        if ix == 0 and iy == 0:
+            return
+        self._sx -= ix
+        self._sy -= iy
+        ev = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, iy, ix)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
     def release_all(self):
         self.left(False)
         self.right(False)
@@ -237,12 +271,17 @@ class Pad:
         self.ctrl = None
         self.joy = None
         self.name = "controller"
-        if sdl_controller.is_controller(index) and not FORCE_RAW:
+        if sdl_controller.is_controller(index):
             self.ctrl = sdl_controller.Controller(index)
             try:
                 self.name = sdl_controller.name_forindex(index) or self.name
             except Exception:
                 pass
+            try:                                   # raw access, used for buttons taught by --learn
+                self.joy = pygame.joystick.Joystick(index)
+                self.joy.init()
+            except Exception:
+                self.joy = None
         else:
             self.joy = pygame.joystick.Joystick(index)
             self.joy.init()
@@ -294,6 +333,9 @@ class Pad:
 
     def button(self, name):
         try:
+            if name in EXTRA_BUTTONS and self.joy is not None:     # taught by --learn → always wins
+                i = EXTRA_BUTTONS[name]
+                return i < self.joy.get_numbuttons() and bool(self.joy.get_button(i))
             if self.ctrl is not None:
                 const = {
                     "a": pygame.CONTROLLER_BUTTON_A,
@@ -301,8 +343,24 @@ class Pad:
                     "lb": pygame.CONTROLLER_BUTTON_LEFTSHOULDER,
                     "rb": pygame.CONTROLLER_BUTTON_RIGHTSHOULDER,
                     "start": pygame.CONTROLLER_BUTTON_START,
+                    "back": pygame.CONTROLLER_BUTTON_BACK,
+                    "guide": pygame.CONTROLLER_BUTTON_GUIDE,
+                    "star": getattr(pygame, "CONTROLLER_BUTTON_MISC1", -1),
+                    "y": pygame.CONTROLLER_BUTTON_Y,
+                    "b": pygame.CONTROLLER_BUTTON_B,
+                    "l3": pygame.CONTROLLER_BUTTON_LEFTSTICK,
+                    "r3": pygame.CONTROLLER_BUTTON_RIGHTSTICK,
+                    "up": pygame.CONTROLLER_BUTTON_DPAD_UP,
+                    "down": pygame.CONTROLLER_BUTTON_DPAD_DOWN,
+                    "left": pygame.CONTROLLER_BUTTON_DPAD_LEFT,
+                    "right": pygame.CONTROLLER_BUTTON_DPAD_RIGHT,
                 }[name]
                 return bool(self.ctrl.get_button(const))
+            if name in ("up", "down", "left", "right"):      # raw pads usually expose the D-pad as a hat
+                if self.joy.get_numhats() == 0:
+                    return False
+                hx, hy = self.joy.get_hat(0)
+                return {"up": hy == 1, "down": hy == -1, "left": hx == -1, "right": hx == 1}[name]
             idx = RAW_BUTTONS[name]
             if idx >= self.joy.get_numbuttons():
                 return False
@@ -314,7 +372,7 @@ class Pad:
         try:
             if self.ctrl is not None:
                 self.ctrl.quit()
-            elif self.joy is not None:
+            if self.joy is not None:
                 self.joy.quit()
         except Exception:
             pass
@@ -341,7 +399,153 @@ def shape_stick(x, y):
         return 0.0, 0.0
     scaled = (min(mag, 1.0) - DEADZONE) / (1.0 - DEADZONE)
     curved = scaled ** CURVE
-    return (x / mag) * curved, (y / mag) * curved
+    sx, sy = (x / mag) * curved, (y / mag) * curved
+    return (-sx if INVERT_X else sx), (-sy if INVERT_Y else sy)
+
+
+def press_option_command_f5():
+    """⌥⌘F5 = macOS Accessibility Shortcut. With ONLY 'Accessibility Keyboard' ticked there,
+    it shows / hides the on-screen keyboard directly."""
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    cmd = Quartz.kCGEventFlagMaskCommand
+    opt = Quartz.kCGEventFlagMaskAlternate
+    fn = Quartz.kCGEventFlagMaskSecondaryFn
+    _key(src, KEY_COMMAND, True, cmd)
+    time.sleep(0.004)
+    _key(src, KEY_OPTION, True, cmd | opt)
+    time.sleep(0.004)
+    _key(src, KEY_F5, True, cmd | opt | fn)
+    time.sleep(0.004)
+    _key(src, KEY_F5, False, cmd | opt | fn)
+    time.sleep(0.004)
+    _key(src, KEY_OPTION, False, cmd)
+    time.sleep(0.004)
+    _key(src, KEY_COMMAND, False, 0)
+
+
+class KeyboardToggle:
+    """Learned keyboard button (default Y), or L3 + R3 together → show / hide the on-screen keyboard."""
+
+    def __init__(self):
+        self.prev = False
+        self.last = 0.0
+
+    def update(self, pad):
+        single = pad.button("osk") if "osk" in EXTRA_BUTTONS else (OSK_BUTTON and pad.button(OSK_BUTTON))
+        cur = bool(single or (pad.button("l3") and pad.button("r3")))
+        now = time.monotonic()
+        if cur and not self.prev and now - self.last > 0.4:
+            self.last = now
+            press_option_command_f5()
+            log("⌨️ ", "On-screen keyboard toggled", SOFT)
+        self.prev = cur
+
+
+class Scroller:
+    """D-pad → scrolling. Holding the D-pad accelerates from SCROLL_SPEED to SCROLL_MAX."""
+
+    def __init__(self):
+        self.t0 = None
+
+    def update(self, pad, mouse, dt, slow=False):
+        vy = (1 if pad.button("up") else 0) - (1 if pad.button("down") else 0)       # +1 = scroll up
+        vx = (1 if pad.button("left") else 0) - (1 if pad.button("right") else 0)    # +1 = scroll left
+        if vx == 0 and vy == 0:
+            self.t0 = None
+            return
+        now = time.perf_counter()
+        if self.t0 is None:
+            self.t0 = now
+        k = clamp((now - self.t0) / SCROLL_RAMP, 0.0, 1.0)
+        speed = SCROLL_SPEED + (SCROLL_MAX - SCROLL_SPEED) * k
+        if slow:
+            speed *= PRECISION_FACTOR
+        if SCROLL_INVERT:
+            vx, vy = -vx, -vy
+        mouse.scroll(vx * speed * dt, vy * speed * dt)
+
+
+NX_KEYTYPE_SOUND_UP = 0
+NX_KEYTYPE_SOUND_DOWN = 1
+
+
+def media_key(key):
+    """Press a real macOS media key (shows the native volume HUD)."""
+    from AppKit import NSEvent
+    for down in (True, False):
+        flags = (0xA if down else 0xB) << 8
+        data1 = (key << 16) | flags
+        ev = NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            14, (0, 0), flags, 0, 0, None, 8, data1, -1)   # 14 = NSSystemDefined, 8 = aux control buttons
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev.CGEvent())
+
+
+_vol_proc = None
+
+
+def change_volume(up):
+    """One volume step. VOLUME_METHOD = "keys" (media keys) or "osascript" (AppleScript)."""
+    global _vol_proc
+    if VOLUME_METHOD == "osascript":
+        if _vol_proc is not None and _vol_proc.poll() is None:
+            return                                   # previous step still running
+        sign = "+" if up else "-"
+        script = f"set volume output volume ((output volume of (get volume settings)) {sign} {VOLUME_STEP})"
+        _vol_proc = subprocess.Popen(["osascript", "-e", script],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        media_key(NX_KEYTYPE_SOUND_UP if up else NX_KEYTYPE_SOUND_DOWN)
+
+
+class VolumeKeys:
+    """'−' (Back/Select) = volume down, '+' (Start) = volume up.
+    Tap = one step, hold = repeat. Press both together = returns "pause"."""
+
+    def __init__(self):
+        self.down_t = {"back": None, "start": None}
+        self.repeating = {"back": False, "start": False}
+        self.last_rep = 0.0
+        self.consumed = False
+
+    @staticmethod
+    def _step(which):
+        change_volume(which == "start")
+
+    def update(self, pad, active=True):
+        now = time.monotonic()
+        pressed = {"back": pad.button("back"), "start": pad.button("start")}
+
+        if self.consumed:                         # wait for both to be released after a chord
+            if not pressed["back"] and not pressed["start"]:
+                self.consumed = False
+            return None
+
+        if pressed["back"] and pressed["start"]:  # both together = pause toggle
+            self.consumed = True
+            for k in self.down_t:
+                self.down_t[k] = None
+                self.repeating[k] = False
+            return "pause"
+
+        for k in ("back", "start"):
+            if pressed[k]:
+                if self.down_t[k] is None:
+                    self.down_t[k] = now          # undecided: tap or hold?
+                    self.repeating[k] = False
+                elif now - self.down_t[k] > VOLUME_HOLD_DELAY:
+                    if not self.repeating[k]:
+                        self.repeating[k] = True
+                        self.last_rep = 0.0
+                    if active and now - self.last_rep >= VOLUME_REPEAT:
+                        self._step(k)
+                        self.last_rep = now
+            elif self.down_t[k] is not None:
+                if active and not self.repeating[k]:   # quick tap → one step
+                    self._step(k)
+                    log("🔊" if k == "start" else "🔉", "Volume " + ("up" if k == "start" else "down"), SOFT)
+                self.down_t[k] = None
+                self.repeating[k] = False
+        return None
 
 
 # ================================ DEBUG ======================================
@@ -378,7 +582,8 @@ def debug_loop():
 
 # ================================= LEARN =====================================
 def learn():
-    """Wizard: press each button once, the script saves YOUR controller's mapping."""
+    """Wizard. ALWAYS teaches the −, + and Home buttons (volume / pause).
+    If SDL doesn't recognise the pad (or you pass --full) it also teaches sticks, A/X, bumpers, triggers."""
     pygame.joystick.quit()
     pygame.joystick.init()
     print(f"{HOT}🎀 Learn mode — turn on your controller. Ctrl+C to cancel.{RESET}")
@@ -387,10 +592,14 @@ def learn():
         time.sleep(0.1)
         pygame.joystick.quit()
         pygame.joystick.init()
+    full = (not sdl_controller.is_controller(0)) or ("--full" in sys.argv)
     joy = pygame.joystick.Joystick(0)
     joy.init()
     nb, na = joy.get_numbuttons(), joy.get_numaxes()
-    print(f"{SOFT}Found: {joy.get_name()}  ({nb} buttons, {na} axes){RESET}\n")
+    print(f"{SOFT}Found: {joy.get_name()}  ({nb} buttons, {na} axes){RESET}")
+    if not full:
+        print(f"{SOFT}Standard mapping detected → only the centre buttons (−, +, Home) and the keyboard button need teaching.{RESET}")
+    print()
 
     def pump():
         pygame.event.pump()
@@ -400,9 +609,10 @@ def learn():
             pump()
             time.sleep(0.02)
 
-    def ask_button(label, hint):
+    def ask_button(label, hint, timeout=None):
         print(f"{PINK}➜ Press {BOLD}{label}{RESET}{PINK}  {DIM}{hint}{RESET}", flush=True)
         wait_release()
+        t0 = time.time()
         while True:
             pump()
             for i in range(nb):
@@ -411,6 +621,9 @@ def learn():
                     time.sleep(0.2)
                     print(f"   {SOFT}→ button {i}{RESET}")
                     return i
+            if timeout and time.time() - t0 > timeout:
+                print(f"   {DIM}skipped{RESET}")
+                return None
             time.sleep(0.01)
 
     def ask_axis(label, allow_button=False, timeout=None):
@@ -425,13 +638,13 @@ def learn():
                 if abs(joy.get_axis(i) - base[i]) > 0.6:
                     time.sleep(0.4)
                     pump()
-                    full = joy.get_axis(i)
+                    full_v = joy.get_axis(i)
                     print(f"   {SOFT}→ axis {i}{RESET}")
                     while abs(joy.get_axis(i) - base[i]) > 0.3:   # wait until released
                         pump()
                         time.sleep(0.02)
                     time.sleep(0.2)
-                    return {"type": "axis", "index": i, "rest": base[i], "full": full}
+                    return {"type": "axis", "index": i, "rest": base[i], "full": full_v}
             if allow_button:
                 for i in range(nb):
                     if joy.get_button(i):
@@ -443,30 +656,67 @@ def learn():
                 return {"type": "none"}
             time.sleep(0.01)
 
-    buttons = {}
-    buttons["a"] = ask_button("A", "(the primary face button → left click)")
-    buttons["x"] = ask_button("X", "(→ right click)")
-    buttons["lb"] = ask_button("L1 / LB", "(left bumper → desktop left)")
-    buttons["rb"] = ask_button("R1 / RB", "(right bumper → desktop right)")
-    buttons["start"] = ask_button("START", "(→ pause / resume)")
+    try:
+        with open(MAP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
 
-    sx = ask_axis("Push the LEFT STICK fully RIGHT and hold, then release")
-    sy = ask_axis("Push the LEFT STICK fully DOWN and hold, then release")
-    rt = ask_axis("Pull the RIGHT TRIGGER (R2/RT) fully — waits 10 s, else skipped", True, 10)
-    lt = ask_axis("Pull the LEFT TRIGGER (L2/LT) fully — waits 10 s, else skipped", True, 10)
+    # ---- step 1: the small centre buttons (always) --------------------------
+    print(f"{HOT}{BOLD}Centre buttons{RESET}")
+    extra = {}
+    extra["back"] = ask_button("−  (SELECT)", "small button LEFT of the logo → volume DOWN")
+    extra["start"] = ask_button("+  (START)", "small button RIGHT of the logo → volume UP")
+    while extra["start"] == extra["back"]:
+        print(f"   {HOT}That's the same button as −. Press the OTHER one (+).{RESET}")
+        extra["start"] = ask_button("+  (START)", "small button RIGHT of the logo → volume UP")
+    home = ask_button("HOME  (logo button)", "→ pause / resume · waits 8 s, then skipped", timeout=8)
+    if home is not None and home not in (extra["back"], extra["start"]):
+        extra["guide"] = home
+    print(f"\n{HOT}{BOLD}On-screen keyboard{RESET}")
+    while True:
+        osk = ask_button("the button for the ON-SCREEN KEYBOARD",
+                         "pick a free one: Y or B are good (NOT A, X, bumpers) · waits 10 s, then skipped (default: Y)",
+                         timeout=10)
+        if osk is None:
+            break
+        if osk in extra.values():
+            print(f"   {HOT}That button is already used for volume / pause. Pick another one.{RESET}")
+            continue
+        extra["osk"] = osk
+        break
+    data["extra_buttons"] = extra
 
-    data = {
-        "force_raw": True,
-        "axes": {"lx": sx["index"], "ly": sy["index"]},
-        "sign": {"lx": 1 if sx["full"] > sx["rest"] else -1,
-                 "ly": 1 if sy["full"] > sy["rest"] else -1},
-        "buttons": buttons,
-        "triggers": {"rt": rt, "lt": lt},
-    }
+    # ---- step 2: everything else (only for unrecognised pads / --full) ------
+    if full:
+        print(f"\n{HOT}{BOLD}Main controls{RESET}")
+        buttons = {}
+        buttons["a"] = ask_button("A", "(the primary face button → left click)")
+        buttons["x"] = ask_button("X", "(→ right click)")
+        buttons["lb"] = ask_button("L1 / LB", "(left bumper → desktop left)")
+        buttons["rb"] = ask_button("R1 / RB", "(right bumper → desktop right)")
+        buttons["start"] = extra["start"]
+        buttons["back"] = extra["back"]
+        if "guide" in extra:
+            buttons["guide"] = extra["guide"]
+
+        sx = ask_axis("Tilt the LEFT STICK fully RIGHT and hold, then release")
+        sy = ask_axis("Tilt the LEFT STICK fully DOWN and hold, then release")
+        rt = ask_axis("Pull the RIGHT TRIGGER (R2/RT) fully — waits 10 s, else skipped", True, 10)
+        lt = ask_axis("Pull the LEFT TRIGGER (L2/LT) fully — waits 10 s, else skipped", True, 10)
+        data.update({
+            "axes": {"lx": sx["index"], "ly": sy["index"]},
+            "sign": {"lx": 1 if sx["full"] > sx["rest"] else -1,
+                     "ly": 1 if sy["full"] > sy["rest"] else -1},
+            "buttons": buttons,
+            "triggers": {"rt": rt, "lt": lt},
+        })
+
     with open(MAP_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     print(f"\n{HOT}💖 Saved to {MAP_FILE}{RESET}")
     print(f"{SOFT}Now run:  python3 pinkpad.py   (or restart pinkpad_menubar.py){RESET}\n")
+
 
 # ================================= MAIN ======================================
 def accessibility_check():
@@ -504,6 +754,9 @@ def main():
     accessibility_check()
 
     mouse = MacMouse()
+    scroller = Scroller()
+    osk = KeyboardToggle()
+    volume = VolumeKeys()
     running = True
     enabled = True
 
@@ -517,7 +770,7 @@ def main():
     pad = None
     last_scan = 0.0
     waiting_msg = False
-    prev = {"a": False, "x": False, "rt": False, "lb": False, "rb": False, "start": False}
+    prev = {"a": False, "x": False, "rt": False, "lb": False, "rb": False, "start": False, "guide": False}
     last_space = 0.0
     last_t = time.perf_counter()
     frame = 1.0 / LOOP_HZ
@@ -557,14 +810,15 @@ def main():
                 mouse.refresh_bounds()
                 last_bounds = time.time()
 
-            # ---- pause toggle -----------------------------------------------
-            start = pad.button("start")
-            if start and not prev["start"]:
+            # ---- volume (−/+) and pause (− and + together, or Home) ---------
+            vol_event = volume.update(pad, enabled)
+            guide = pad.button("guide")
+            if vol_event == "pause" or (guide and not prev["guide"]):
                 enabled = not enabled
                 if not enabled:
                     mouse.release_all()
                 log("⏸️ " if not enabled else "▶️ ", "Paused" if not enabled else "Resumed", HOT)
-            prev["start"] = start
+            prev["guide"] = guide
 
             if enabled:
                 # ---- mouse movement ------------------------------------------
@@ -593,6 +847,12 @@ def main():
                 # keep the combined state consistent
                 if not (prev["x"] or prev["rt"]):
                     mouse.right(False)
+
+                # ---- scroll (D-pad) -------------------------------------------
+                scroller.update(pad, mouse, dt, pad.axis("lt") > 0.2)
+
+                # ---- on-screen keyboard (★ or L3+R3) ----------------------------
+                osk.update(pad)
 
                 # ---- desktops (Spaces) ---------------------------------------
                 lb, rb = pad.button("lb"), pad.button("rb")
